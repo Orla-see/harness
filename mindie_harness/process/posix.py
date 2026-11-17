@@ -208,7 +208,6 @@ def run_posix(
     stderr_buf = bytearray()
     total_captured = 0
     cleanup_issues: list[dict[str, str]] = []
-    leader_reaped_kill = False
 
     def _build_outcome(execution: str, returncode: int | None) -> ProcessOutcome:
         elapsed_ms = int((time.monotonic() - started) * 1000)
@@ -258,10 +257,6 @@ def run_posix(
                 err.outcome = _build_outcome("unknown", proc.poll())  # type: ignore[attr-defined]
                 raise err
 
-            if proc.poll() is not None and not leader_reaped_kill:
-                leader_reaped_kill = True
-                _kill_pgroup(proc.pid, grace_seconds=0.05)
-
             events = selector.select(timeout=min(0.05, rem))
             for key, _ in events:
                 tag = key.data
@@ -306,8 +301,7 @@ def run_posix(
                     stderr_buf.extend(chunk)
 
         proc.wait(timeout=max(0.1, deadline.cleanup_grace))
-        if not leader_reaped_kill:
-            _kill_pgroup(proc.pid, grace_seconds=0.05)
+        _kill_pgroup(proc.pid, grace_seconds=0.05)
         return _build_outcome("completed", proc.returncode)
     finally:
         if spool_file is not None:
