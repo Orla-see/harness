@@ -746,9 +746,13 @@ def run_win32(
             wait_ms = max(1, min(25, int(rem * 1000)))
             state = _k32.WaitForSingleObject(proc_handle, wait_ms)
             if state == WAIT_OBJECT_0:
-                # Leader exited; terminate any remaining Job descendants so inherited pipes close cleanly.
-                _terminate_job()
-                break
+                if not t_out.is_alive() and not t_err.is_alive():
+                    _terminate_job()
+                    break
+                t_out.join(timeout=min(0.025, rem))
+                if not t_out.is_alive() and not t_err.is_alive():
+                    _terminate_job()
+                    break
 
         grace_join = max(0.2, min(2.0, deadline.cleanup_grace))
         t_out.join(timeout=grace_join)
