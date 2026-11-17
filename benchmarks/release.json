@@ -1,0 +1,31 @@
+{
+  "schema_version": "mindie-release-suite/1",
+  "suite": "core",
+  "publishable": true,
+  "cases": [
+    {
+      "id": "seed-lock-verify",
+      "kind": "microbenchmark",
+      "required": true,
+      "repetitions": 5,
+      "timeout_seconds": 20,
+      "command": [
+        "{python}",
+        "benchmarks/release.py",
+        "seed-lock-verify"
+      ]
+    },
+    {
+      "id": "mcp-router-dispatch",
+      "kind": "microbenchmark",
+      "required": true,
+      "repetitions": 5,
+      "timeout_seconds": 20,
+      "command": [
+        "{python}",
+        "benchmarks/release.py",
+        "mcp-router-dispatch"
+      ]
+    }
+  ]
+}

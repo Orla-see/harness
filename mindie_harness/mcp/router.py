@@ -1,0 +1,610 @@
+"""`P2.7` zero-binding deterministic MCP router vs `P2.1` strict `knowledge_*` admission.
+
+[Role]
+Validates MCP `tools/call` envelopes, enforces forged-identity argument rejection,
+routes deterministic tools (`remote_*`, `coordinator`, `debugger`, `diagnostics`,
+`npu-top`, `profiler`, `sim`) with ZERO pre-call session-binding gates (`P2.7`),
+enforces strict session + manual `/mindie-agent` + consent admission on `knowledge_*`
+(`P2.1`), and preserves Receipt Honesty when local accounting fails after success.
+
+[Invariants]
+- Never mutates global `os.environ` or `os.chdir()`; every call builds an isolated
+  `RequestContext` (`session_id`, `cwd`, `env`, `deadline`, `cancel`).
+- Read-only / status / cancel deterministic tools (`is_readonly_or_control_tool`)
+  have ZERO artificial concurrency cap (`AD-09` fixed) and zero replay-ledger lock contention.
+- Deterministic tools silently strip legacy optional `_mindie_bind_id` / `request_nonce`
+  if sent by older clients and NEVER require them (`P2.7`).
+- `knowledge_*` tools check `admission.sqlite3` via `open_wal_database(..., create=False)`
+  (never creating empty DBs on unactivated checks, Iron Rule 1) and require
+  `enabled == 1 AND entry_enabled == 1`.
+
+[Timeouts & Locks]
+- Enforces Principle 10 per-tool budgets (`remote_bash` `660s = 600s + 60s`,
+  `remote_write_stdin` `360s = 300s + 60s`, `components` `130s = 120s + 10s`,
+  `knowledge` `45s = 35s + 10s` / `120s = 110s + 10s`).
+
+[Side-Effect Policy]
+- Dispatches validated tool invocations through the bound `HostAdapter` or handler map
+  and records mutation receipts in `RemoteReceipts`.
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass
+import hashlib
+import json
+import math
+import os
+from pathlib import Path
+import sqlite3
+import threading
+from typing import Any, Callable, Mapping
+import uuid
+
+from ..atomic import read_json_safe
+from ..paths import HarnessError, ProfileRef, open_wal_database
+from ..process.supervisor import Deadline, ProcessCancelledError
+from ..rsi import rsi_explore
+from .receipts import BindStore, RemoteReceipts, apply_receipt_honesty
+
+FORGED_IDENTITY_KEYS: frozenset[str] = frozenset(
+    {
+        "session",
+        "session_id",
+        "conversation_id",
+        "mindie_activation",
+        "token",
+        "project_root",
+    }
+)
+CORRELATION_STRIP_KEYS: frozenset[str] = frozenset({"_mindie_bind_id", "request_nonce"})
+
+REMOTE_NATIVE_MAX_WAIT_MS: dict[str, int] = {
+    "remote_bash": 600_000,
+    "remote_run_command": 600_000,
+    "remote_write_stdin": 300_000,
+    "remote_job_stdin": 300_000,
+    "remote_exec_command": 30_000,
+}
+REMOTE_GRACE_SECONDS = 60.0
+REMOTE_MIN_BUDGET_SECONDS = 180.0
+
+READONLY_TOOL_PREFIXES: tuple[str, ...] = (
+    "remote_read",
+    "remote_cat",
+    "remote_grep",
+    "remote_glob",
+    "remote_find",
+    "remote_stat",
+    "remote_list",
+    "remote_ls",
+    "remote_job_status",
+    "remote_job_output",
+    "remote_job_poll",
+    "remote_job_list",
+    "remote_job_cancel",
+    "remote_cancel",
+    "remote_ping",
+    "remote_hosts",
+    "mindie_status",
+    "mindie_interrupt",
+    "npu_top",
+    "diagnostics_status",
+    "debugger_triage",
+)
+CONSENT_REQUIRED_KNOWLEDGE_TOOLS: frozenset[str] = frozenset(
+    {"knowledge_distill", "knowledge_export", "knowledge_publish"}
+)
+
+
+@dataclass(frozen=True)
+class RequestContext:
+    """Per-request isolated execution context (zero global `os.environ`/`cwd` mutation)."""
+
+    request_id: str | int
+    surface: str
+    tool_name: str
+    session_id: str
+    cwd: Path | None
+    env: dict[str, str]
+    deadline: Deadline
+    cancel: threading.Event
+
+
+def is_readonly_or_control_tool(name: str, tool_schema: Mapping[str, Any] | None = None) -> bool:
+    """Return True when `name` is a read-only query, status poll, or cancellation tool."""
+    clean = str(name or "").strip()
+    if clean.startswith(READONLY_TOOL_PREFIXES):
+        return True
+    if isinstance(tool_schema, Mapping):
+        annotations = tool_schema.get("annotations")
+        if isinstance(annotations, Mapping) and annotations.get("readOnlyHint") is True:
+            return True
+    return False
+
+
+def compute_tool_deadline(
+    surface: str,
+    tool_name: str,
+    arguments: Mapping[str, Any] | None = None,
+    *,
+    explicit_timeout: float | None = None,
+) -> Deadline:
+    """Compute Principle-10 outer `Deadline` (`outer >= inner + cleanup_grace`)."""
+    args = arguments or {}
+    if surface == "remote" or tool_name.startswith("remote_"):
+        native_ms = float(REMOTE_NATIVE_MAX_WAIT_MS.get(tool_name, 0))
+        caller_ms = 0.0
+        for k in ("yield_time_ms", "timeout_ms"):
+            val = args.get(k)
+            if not isinstance(val, bool) and isinstance(val, (int, float)) and math.isfinite(val) and val > 0:
+                caller_ms = max(caller_ms, float(val))
+        inner_sec = max(native_ms / 1000.0, caller_ms / 1000.0)
+        outer = max(REMOTE_MIN_BUDGET_SECONDS, inner_sec + REMOTE_GRACE_SECONDS)
+        if explicit_timeout is not None and explicit_timeout > outer:
+            outer = float(explicit_timeout)
+        return Deadline.from_timeout(outer, cleanup_grace=REMOTE_GRACE_SECONDS)
+
+    if surface == "knowledge" or tool_name.startswith("knowledge_"):
+        inner_sec = 110.0 if tool_name in {"knowledge_sync", "knowledge_distill"} else 35.0
+        grace = 10.0
+        required = inner_sec + grace
+        if explicit_timeout is not None:
+            if float(explicit_timeout) < required:
+                raise HarnessError(
+                    f"{tool_name} timeout ({explicit_timeout}s) is shorter than inner+grace ({required}s)",
+                    stage="tool_schema",
+                    reason="invalid_timeout_budget",
+                    reportable=False,
+                )
+            return Deadline.from_timeout(float(explicit_timeout), cleanup_grace=grace)
+        return Deadline.from_timeout(required, cleanup_grace=grace)
+
+    # Deterministic component tools (coordinator, debugger, profiler, sim, npu-top, diagnostics)
+    inner_sec = 120.0
+    grace = 10.0
+    outer = max(inner_sec + grace, float(explicit_timeout or 0.0))
+    return Deadline.from_timeout(outer, cleanup_grace=grace)
+
+
+def _extract_meta_session(request: Mapping[str, Any], env: Mapping[str, str]) -> str | None:
+    params = request.get("params")
+    meta = params.get("_meta") if isinstance(params, Mapping) else None
+    if isinstance(meta, Mapping):
+        for key in ("session_id", "sessionId", "threadId", "conversationId", "claudecode/sessionId"):
+            val = meta.get(key)
+            if isinstance(val, str) and val.strip():
+                return val.strip()
+    for env_key in (
+        "MINDIE_SESSION_ID",
+        "REMOTE_DEV_SESSION_ID",
+        "CODEX_THREAD_ID",
+        "KIMI_SESSION_ID",
+        "OPENCODE_SESSION_ID",
+        "CLAUDE_SESSION_ID",
+    ):
+        val = env.get(env_key)
+        if isinstance(val, str) and val.strip():
+            return val.strip()
+    return None
+
+
+def _extract_meta_bind_id(request: Mapping[str, Any]) -> str | None:
+    params = request.get("params")
+    meta = params.get("_meta") if isinstance(params, Mapping) else None
+    if isinstance(meta, Mapping):
+        for key in ("claudecode/toolUseId", "toolUseId", "bind_id", "_mindie_bind_id"):
+            val = meta.get(key)
+            if isinstance(val, str) and val.strip():
+                return val.strip()
+    return None
+
+
+def _verify_knowledge_admission(profile: ProfileRef, session_id: str, tool_name: str, deadline: Deadline) -> None:
+    """Enforce `P2.1` manual `/mindie-agent` entry lease + sharing consent for `knowledge_*`."""
+    conn = open_wal_database(profile.admission_db, create=False, deadline=deadline.expires_at)
+    if conn is None:
+        raise HarnessError(
+            "Knowledge tools require explicit `/mindie-agent` session activation (`admission.sqlite3` absent).",
+            stage="admission",
+            reason="knowledge_lease_inactive",
+            submission_state="not_sent",
+            retryable=False,
+            reportable=False,
+        )
+    try:
+        row = conn.execute(
+            "SELECT enabled, entry_enabled FROM leases WHERE session=?",
+            (session_id,),
+        ).fetchone()
+    except sqlite3.Error as exc:
+        raise HarnessError(
+            f"Unable to verify knowledge session lease: {type(exc).__name__}",
+            stage="admission",
+            reason="admission_unavailable",
+            submission_state="not_sent",
+            retryable=False,
+            reportable=False,
+        ) from exc
+    finally:
+        conn.close()
+
+    if row is None or int(row[0]) != 1 or int(row[1]) != 1:
+        raise HarnessError(
+            f"Session {session_id!r} has not manually activated `/mindie-agent` knowledge access.",
+            stage="admission",
+            reason="knowledge_lease_inactive",
+            submission_state="not_sent",
+            retryable=False,
+            reportable=False,
+        )
+
+    if tool_name in CONSENT_REQUIRED_KNOWLEDGE_TOOLS:
+        consent_doc = read_json_safe(profile.consent_path)
+        if not isinstance(consent_doc, dict) or consent_doc.get("choice") != "contribute":
+            raise HarnessError(
+                f"{tool_name} requires explicit sharing consent (`choice='contribute'`) in mindie-consent.json.",
+                stage="admission",
+                reason="consent_required",
+                submission_state="not_sent",
+                retryable=False,
+                reportable=False,
+            )
+
+
+def _format_mcp_error(exc: BaseException) -> dict[str, Any]:
+    if isinstance(exc, HarnessError):
+        info = exc.to_dict()
+        return {
+            "content": [{"type": "text", "text": f"{exc} (reason={exc.reason}). No automatic retry."}],
+            "isError": True,
+            "structuredContent": info,
+        }
+    if isinstance(exc, TimeoutError):
+        return {
+            "content": [
+                {
+                    "type": "text",
+                    "text": "MindIE request deadline exceeded; external outcome may be unconfirmed. Inspect state before retrying.",
+                }
+            ],
+            "isError": True,
+            "structuredContent": {
+                "stage": "timeout",
+                "reason": "helper_timeout",
+                "submission_state": "uncertain",
+                "retryable": False,
+            },
+        }
+    return {
+        "content": [{"type": "text", "text": f"MindIE tool execution failed ({type(exc).__name__})."}],
+        "isError": True,
+        "structuredContent": {
+            "stage": "dispatch",
+            "reason": "internal_error",
+            "error_type": type(exc).__name__,
+            "retryable": False,
+        },
+    }
+
+
+ToolHandler = Callable[[RequestContext, dict[str, Any]], dict[str, Any]]
+
+
+class MCPRouter:
+    """Thread-safe MCP `tools/list` and `tools/call` router for one resident connection."""
+
+    def __init__(
+        self,
+        profile: ProfileRef,
+        *,
+        surface: str = "all",
+        tools: list[dict[str, Any]] | None = None,
+        handler: ToolHandler | None = None,
+        session_extractor: Callable[[Mapping[str, Any], Mapping[str, str]], str | None] | None = None,
+        base_env: Mapping[str, str] | None = None,
+    ) -> None:
+        self.profile = profile
+        self.surface = surface
+        self.connection_id = uuid.uuid4().hex
+        self._base_env = dict(os.environ if base_env is None else base_env)
+        self._tools = list(tools or self._default_tools())
+        self._tool_map = {str(t["name"]): dict(t) for t in self._tools if isinstance(t, dict) and "name" in t}
+        self._handler = handler
+        self._session_extractor = session_extractor
+        self.receipts = RemoteReceipts(profile.receipts_db)
+        self.binds = BindStore(profile.binds_db)
+
+    def _default_tools(self) -> list[dict[str, Any]]:
+        status_tool = {
+            "name": "mindie_status",
+            "description": "Read active MindIE Harness runtime and profile health (read-only, zero binding required).",
+            "annotations": {"readOnlyHint": True},
+            "inputSchema": {
+                "type": "object",
+                "properties": {},
+                "required": [],
+            },
+        }
+        return [status_tool]
+
+    def list_tools(self) -> list[dict[str, Any]]:
+        """Return public tools for `self.surface` (`knowledge_*` never leaked on unactivated discovery)."""
+        if self.surface == "knowledge":
+            return []
+        visible: list[dict[str, Any]] = []
+        for tool in self._tools:
+            name = str(tool.get("name", ""))
+            if name.startswith("knowledge_"):
+                continue
+            cleaned = dict(tool)
+            schema = cleaned.get("inputSchema")
+            if isinstance(schema, dict) and isinstance(schema.get("required"), list):
+                # Enforce P2.7: deterministic tools NEVER require `request_nonce` or `_mindie_bind_id`!
+                cleaned["inputSchema"] = {
+                    **schema,
+                    "required": [r for r in schema["required"] if r not in CORRELATION_STRIP_KEYS],
+                }
+            visible.append(cleaned)
+        return visible
+
+    def is_fast_lane_call(self, request: Mapping[str, Any]) -> bool:
+        params = request.get("params")
+        if not isinstance(params, Mapping):
+            return True
+        name = str(params.get("name") or "")
+        return is_readonly_or_control_tool(name, self._tool_map.get(name))
+
+    def _validate_and_clean_args(self, name: str, raw_args: Any) -> tuple[dict[str, Any], str | None]:
+        if raw_args is None:
+            raw_args = {}
+        if not isinstance(raw_args, Mapping):
+            raise HarnessError(
+                "MCP tool arguments must be a JSON object",
+                stage="tool_schema",
+                reason="input_not_object",
+                reportable=False,
+            )
+        forged = FORGED_IDENTITY_KEYS.intersection(raw_args.keys())
+        if forged:
+            raise HarnessError(
+                "Model-supplied identity override arguments are forbidden",
+                stage="tool_schema",
+                reason="forged_identity_argument",
+                reportable=False,
+            )
+        args = dict(raw_args)
+        bind_id = args.get("_mindie_bind_id") if isinstance(args.get("_mindie_bind_id"), str) else None
+        if not name.startswith("knowledge_"):
+            for key in CORRELATION_STRIP_KEYS:
+                args.pop(key, None)
+
+        tool_def = self._tool_map.get(name)
+        if tool_def is None:
+            raise HarnessError(
+                f"Unknown MindIE MCP tool: {name!r}",
+                stage="tool_schema",
+                reason="unknown_operation",
+                reportable=False,
+            )
+        schema = tool_def.get("inputSchema")
+        if isinstance(schema, Mapping):
+            props = schema.get("properties")
+            req = [r for r in (schema.get("required") or ()) if name.startswith("knowledge_") or r not in CORRELATION_STRIP_KEYS]
+            missing = [r for r in req if r not in args]
+            if missing:
+                raise HarnessError(
+                    f"Missing required argument `{missing[0]}` for {name}",
+                    stage="tool_schema",
+                    reason="schema_missing_field",
+                    reportable=False,
+                    details={"field": missing[0]},
+                )
+            if isinstance(props, Mapping) and schema.get("additionalProperties") is False:
+                unknown = set(args) - set(props)
+                if unknown:
+                    raise HarnessError(
+                        f"Undeclared arguments supplied to {name}",
+                        stage="tool_schema",
+                        reason="schema_unknown_field",
+                        reportable=False,
+                    )
+
+        if name in {"knowledge_query", "knowledge_explain"}:
+            try:
+                args = rsi_explore.parse_args(args)
+            except ValueError as exc:
+                raise HarnessError(
+                    str(exc),
+                    stage="tool_schema",
+                    reason="invalid_rsi_arguments",
+                    reportable=False,
+                ) from exc
+        return args, bind_id
+
+    def call_tool(
+        self,
+        request: Mapping[str, Any],
+        *,
+        cancel: threading.Event | None = None,
+        timeout: float | None = None,
+    ) -> dict[str, Any]:
+        """Validate, admit, execute, and finalize one MCP `tools/call` request."""
+        cancel_ev = cancel or threading.Event()
+        req_id = request.get("id", "0")
+        params = request.get("params")
+        if not isinstance(params, Mapping):
+            return _format_mcp_error(
+                HarnessError("Missing params object", stage="cli_input", reason="input_not_object", reportable=False)
+            )
+        name = str(params.get("name") or "")
+        claimed_call_id: str | None = None
+        claimed_bind_id: str | None = None
+        primary_succeeded = False
+        outcome_label = "unknown"
+        result: dict[str, Any] | None = None
+
+        try:
+            args, explicit_bind_id = self._validate_and_clean_args(name, params.get("arguments"))
+            deadline = compute_tool_deadline(self.surface, name, args, explicit_timeout=timeout)
+            args_digest = hashlib.sha256(json.dumps(args, sort_keys=True).encode("utf-8")).hexdigest()
+
+            extracted_session = (
+                self._session_extractor(request, self._base_env)
+                if self._session_extractor is not None
+                else None
+            ) or _extract_meta_session(request, self._base_env)
+            effective_bind_id = explicit_bind_id or _extract_meta_bind_id(request)
+
+            bound_cwd: Path | None = None
+            try:
+                bind_row = self.binds.claim_bind(
+                    bind_id=effective_bind_id,
+                    session=extracted_session,
+                    tool=name,
+                    args_digest=args_digest,
+                    deadline=deadline.expires_at,
+                )
+            except (TimeoutError, sqlite3.Error, OSError):
+                bind_row = None
+
+            if bind_row is not None:
+                claimed_bind_id = bind_row["bind_id"]
+                extracted_session = extracted_session or bind_row["session"]
+                if bind_row.get("cwd"):
+                    bound_cwd = Path(bind_row["cwd"])
+
+            if name.startswith("knowledge_"):
+                if not extracted_session:
+                    raise HarnessError(
+                        "Knowledge tools require verified host session identity (`P2.1`).",
+                        stage="admission",
+                        reason="session_identity_required",
+                        submission_state="not_sent",
+                        reportable=False,
+                    )
+                session_id = extracted_session
+                _verify_knowledge_admission(self.profile, session_id, name, deadline)
+            else:
+                # Iron Rule 5 (P2.7): zero pre-call session binding required on deterministic tools!
+                session_id = extracted_session or f"{self.profile.host}-conn-{self.connection_id[:12]}"
+
+            readonly = is_readonly_or_control_tool(name, self._tool_map.get(name))
+            if not readonly and not name.startswith("knowledge_"):
+                req_hash = hashlib.sha256(json.dumps(req_id, sort_keys=True).encode("utf-8")).hexdigest()[:24]
+                call_id = f"{self.connection_id}:{req_hash}"
+                if not self.receipts.claim(
+                    call_id,
+                    session=session_id,
+                    tool=name,
+                    args_sha256=args_digest,
+                    deadline=deadline.expires_at,
+                ):
+                    raise HarnessError(
+                        "Duplicate MCP mutation request ID on this connection; not replayed.",
+                        stage="admission",
+                        reason="duplicate_request",
+                        submission_state="not_sent",
+                        retryable=False,
+                        reportable=False,
+                    )
+                claimed_call_id = call_id
+
+            req_env = {
+                **self._base_env,
+                "MINDIE_SESSION_ID": session_id,
+                "REMOTE_DEV_SESSION_ID": session_id,
+                "MINDIE_AGENT_CONFIG": str(self.profile.config_path),
+            }
+            ctx = RequestContext(
+                request_id=req_id,
+                surface=self.surface,
+                tool_name=name,
+                session_id=session_id,
+                cwd=bound_cwd,
+                env=req_env,
+                deadline=deadline,
+                cancel=cancel_ev,
+            )
+
+            if name == "mindie_status" and self._handler is None:
+                result = {
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": json.dumps(
+                                {
+                                    "status": "ok",
+                                    "host": self.profile.host,
+                                    "session_id": session_id,
+                                    "config_path": str(self.profile.config_path),
+                                },
+                                sort_keys=True,
+                            ),
+                        }
+                    ],
+                    "isError": False,
+                }
+            elif self._handler is not None:
+                result = self._handler(ctx, args)
+            else:
+                raise HarnessError(
+                    f"No execution handler registered for tool {name!r}",
+                    stage="dispatch",
+                    reason="handler_unavailable",
+                    submission_state="not_sent",
+                    reportable=False,
+                )
+
+            if not isinstance(result, dict):
+                raise HarnessError("Tool handler returned non-object response", stage="dispatch", reason="invalid_response")
+
+            structured = result.get("structuredContent")
+            uncertain = isinstance(structured, Mapping) and (
+                structured.get("submission_state") == "uncertain"
+                or structured.get("status") == "submission_uncertain"
+            )
+            if uncertain:
+                outcome_label = "unknown"
+            elif result.get("isError") is True:
+                outcome_label = "failed"
+            else:
+                outcome_label = "succeeded"
+                primary_succeeded = True
+            return result
+
+        except ProcessCancelledError as exc:
+            outcome_label = "unknown"
+            result = _format_mcp_error(exc)
+            return result
+        except Exception as exc:
+            outcome_label = "unknown" if isinstance(exc, TimeoutError) else "failed"
+            result = _format_mcp_error(exc)
+            return result
+        finally:
+            accounting_exc: BaseException | None = None
+            if claimed_call_id is not None:
+                try:
+                    self.receipts.finish(claimed_call_id, outcome_label)
+                except TimeoutError as exc:
+                    if not primary_succeeded:
+                        raise
+                    accounting_exc = exc
+                except (OSError, sqlite3.Error, HarnessError, ValueError) as exc:
+                    accounting_exc = exc
+            if claimed_bind_id is not None:
+                try:
+                    self.binds.finish_bind(
+                        claimed_bind_id,
+                        "completed" if outcome_label == "succeeded" else "failed",
+                    )
+                except TimeoutError as exc:
+                    if not primary_succeeded and accounting_exc is None:
+                        raise
+                    accounting_exc = accounting_exc or exc
+                except (OSError, sqlite3.Error, HarnessError, ValueError) as exc:
+                    accounting_exc = accounting_exc or exc
+
+            if accounting_exc is not None and primary_succeeded and isinstance(result, dict):
+                patched = apply_receipt_honesty(result, accounting_exc)
+                result.clear()
+                result.update(patched)

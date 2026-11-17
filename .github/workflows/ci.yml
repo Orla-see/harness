@@ -1,0 +1,98 @@
+name: harness-ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    types: [opened, edited, synchronize, reopened, ready_for_review]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  governance:
+    name: LF Line Endings, Seed Lock & PR Checklist
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: '3.12'
+      - name: Enforce Unix LF Line Endings
+        run: python3 .github/scripts/check_lf_eol.py
+      - name: Verify Reproducible Seed Zipapp (`mindie-harness-seed/1`)
+        run: python3 scripts/build_seed.py --check
+      - name: Validate Pre-PR Checklist (`--profile harness`)
+        if: github.event_name == 'pull_request'
+        env:
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: python3 .github/scripts/check_pr_checklist.py --profile harness
+
+  test:
+    name: Orthogonal Tests (${{ matrix.os }}, py${{ matrix.python }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        python: ['3.11', '3.12', '3.13']
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: ${{ matrix.python }}
+      - run: uv venv
+      - run: uv pip install -e ".[test]"
+      - run: uv run --no-project python -m pytest -q --junitxml=results.xml
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: harness-${{ matrix.os }}-${{ matrix.python }}
+          path: results.xml
+
+  installed-artifact-smoke:
+    name: Out-of-Tree Wheel & MCP Handshake Smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: '3.11'
+      - run: uv build
+      - name: Install Wheel in Blank Directory Outside Repo Checkout
+        run: |
+          SMOKE_ROOT="$(mktemp -d)"
+          trap 'rm -rf "$SMOKE_ROOT"' EXIT
+          uv venv "$SMOKE_ROOT/venv"
+          uv pip install --python "$SMOKE_ROOT/venv/bin/python" --no-deps dist/*.whl
+          mkdir -p "$SMOKE_ROOT/empty" "$SMOKE_ROOT/cfg" "$SMOKE_ROOT/data"
+          cd "$SMOKE_ROOT/empty"
+          export HOME="$SMOKE_ROOT/home"
+          export MINDIE_CONFIG_HOME="$SMOKE_ROOT/cfg"
+          export MINDIE_DATA_HOME="$SMOKE_ROOT/data"
+          "$SMOKE_ROOT/venv/bin/python" -I -c "import importlib.metadata as m; assert not [x for x in m.requires('mindie-harness') or [] if 'extra ==' not in x]"
+          "$SMOKE_ROOT/venv/bin/mindie-harness" --version
+          "$SMOKE_ROOT/venv/bin/mindie-harness" inspect --host codex
+          printf '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}\n{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"mindie_status","arguments":{}}}\n' \
+            | "$SMOKE_ROOT/venv/bin/mindie-harness" --host codex mcp tools
+
+  release-ready:
+    name: release-ready
+    needs: [governance, test, installed-artifact-smoke]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - env:
+          RESULTS: ${{ toJSON(needs) }}
+        run: python3 -c 'import json,os; assert all(job["result"] == "success" for job in json.loads(os.environ["RESULTS"]).values()), "required CI failed or was skipped"'

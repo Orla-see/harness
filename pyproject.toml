@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mindie-harness"
+version = "0.1.0"
+description = "Standalone pure-stdlib shared plugin substrate, process/Job supervisor, atomic dual-generation runtime updater, concurrent MCP gateway, and RSI ledger engine for MindIE Agent"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.optional-dependencies]
+updates = ["packaging>=23.2"]
+test = ["pytest>=8,<10"]
+
+[project.scripts]
+mindie-harness = "mindie_harness.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["mindie_harness*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "tier0: pure in-memory deterministic unit tests (<5s)",
+    "tier1: local OS process, SQLite WAL, Git worktree, and fault-injection boundary tests (<15s)",
+    "tier1w: real Windows 11 + WSL2 kernel Job Object, PE Subsystem, .inuse lease, and DrvFS tests (<25s)",
+    "live_npu: standing A2/A3 Ascend NPU non-destructive live integration (<25s)",
+]
