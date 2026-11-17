@@ -176,7 +176,13 @@ def is_wsl_drvfs(path: str | Path, *, mountinfo_text: str | None = None) -> bool
     entries = parse_mountinfo(mountinfo_text)
     if not entries:
         return False
-    target = _existing_ancestor_resolved(Path(path))
+    raw_path = os.fspath(path)
+    if os.name == "nt" and raw_path.startswith("/"):
+        import posixpath
+
+        target = posixpath.normpath(raw_path)
+    else:
+        target = _existing_ancestor_resolved(Path(path))
     if not target.startswith("/"):
         return False
 

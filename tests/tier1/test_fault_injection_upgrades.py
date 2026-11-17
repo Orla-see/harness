@@ -51,9 +51,12 @@ def _make_fast_builder(exit_code: int = 0):
         if exit_code != 0:
             raise HarnessError("simulated uv failure", stage="runtime_build", reason="candidate_build_failed_cleanly", retryable=True, reportable=False)
         if os.name == "nt":
-            # Symlink or copy current python.exe + create valid GUI pythonw.exe
+            # Copy PEP-405 pyvenv.cfg if running inside a venv so venvlauncher exits 0 instead of 106
             import shutil
 
+            src_cfg = Path(sys.prefix) / "pyvenv.cfg"
+            if src_cfg.is_file():
+                shutil.copy2(src_cfg, venv_dir / "pyvenv.cfg")
             shutil.copy2(sys.executable, py)
             src_pyw = Path(sys.executable).with_name("pythonw.exe")
             if src_pyw.is_file():

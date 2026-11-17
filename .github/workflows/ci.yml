@@ -21,6 +21,7 @@ jobs:
           persist-credentials: false
       - uses: astral-sh/setup-uv@v6
         with:
+          enable-cache: false
           python-version: '3.12'
       - name: Enforce Unix LF Line Endings
         run: python3 .github/scripts/check_lf_eol.py
@@ -47,6 +48,7 @@ jobs:
           persist-credentials: false
       - uses: astral-sh/setup-uv@v6
         with:
+          enable-cache: false
           python-version: ${{ matrix.python }}
       - run: uv venv
       - run: uv pip install -e ".[test]"
@@ -67,6 +69,7 @@ jobs:
           persist-credentials: false
       - uses: astral-sh/setup-uv@v6
         with:
+          enable-cache: false
           python-version: '3.11'
       - run: uv build
       - name: Install Wheel in Blank Directory Outside Repo Checkout

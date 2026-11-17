@@ -276,6 +276,9 @@ class Tier1WLiveSuite(unittest.TestCase):
         def _copy_builder(_g: Path, venv_dir: Path, _env: dict, _dl: Deadline) -> None:
             py = venv_python_path(venv_dir)
             py.parent.mkdir(parents=True, exist_ok=True)
+            src_cfg = Path(sys.prefix) / "pyvenv.cfg"
+            if src_cfg.is_file():
+                shutil.copy2(src_cfg, venv_dir / "pyvenv.cfg")
             shutil.copy2(sys.executable, py)
             shutil.copy2(Path(sys.executable).with_name("pythonw.exe"), py.with_name("pythonw.exe"))
 
