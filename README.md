@@ -1,12 +1,12 @@
 # MindIE Harness (`mindie-harness`)
 
 <p>
-  <a href="https://github.com/mindie-agent/harness/releases"><img src="https://img.shields.io/badge/Release-v0.1.0-blue" alt="Release v0.1.0"></a>
+  <a href="https://github.com/mindie-agent/harness/releases"><img src="https://img.shields.io/badge/Release-v0.1.1-blue" alt="Release v0.1.1"></a>
 </p>
 
 [English](README.en.md) | 简体中文
 
-`mindie-harness`（仓库 `mindie-agent/harness`，导入包 `mindie_harness`，当前版本 `0.1.0`）是 MindIE Agent 7 个原生宿主插件（`codex`、`cc`、`kimi`、`dsh`、`agy`、`wb`、`oc`）共用的**零重依赖纯 Python 标准库底座**。
+`mindie-harness`（仓库 `mindie-agent/harness`，导入包 `mindie_harness`，当前版本 `0.1.1`）是 MindIE Agent 7 个原生宿主插件（`codex`、`cc`、`kimi`、`dsh`、`agy`、`wb`、`oc`）共用的**零重依赖纯 Python 标准库底座**。
 
 ## 核心职责边界
 
