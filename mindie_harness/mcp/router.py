@@ -160,8 +160,17 @@ def compute_tool_deadline(
         return Deadline.from_timeout(required, cleanup_grace=grace)
 
     # Deterministic component tools (coordinator, debugger, profiler, sim, npu-top, diagnostics)
-    inner_sec = 120.0
-    grace = 10.0
+    caller_ms = args.get("timeout_ms")
+    caller_sec = (
+        float(caller_ms) / 1000.0
+        if not isinstance(caller_ms, bool)
+        and isinstance(caller_ms, (int, float))
+        and math.isfinite(caller_ms)
+        and caller_ms > 0
+        else 120.0
+    )
+    inner_sec = max(120.0, min(600.0, caller_sec))
+    grace = 60.0 if inner_sec > 120.0 else 10.0
     outer = max(inner_sec + grace, float(explicit_timeout or 0.0))
     return Deadline.from_timeout(outer, cleanup_grace=grace)
 

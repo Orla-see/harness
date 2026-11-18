@@ -12,7 +12,7 @@ import threading
 
 import pytest
 
-from mindie_harness.api import DefaultHostAdapter, ProfileRef, run_host
+from mindie_harness.api import DefaultHostAdapter, ProfileRef, __version__, run_host
 from mindie_harness.atomic import atomic_write_json, stage_retire_directory
 from mindie_harness.bootstrap.seed_main import (
     _provision_cold,
@@ -133,7 +133,7 @@ def test_cold_seed_provisions_requirements_plugin_with_wheelhouse_and_rejects_br
         timeout=60.0,
     )
     req_plugin = tmp_path / "kimi-plugin"
-    (req_plugin / "runtime-requirements.txt").write_text("mindie-harness==0.1.0\n", encoding="utf-8")
+    (req_plugin / "runtime-requirements.txt").write_text(f"mindie-harness=={__version__}\n", encoding="utf-8")
     kimi_cfg = tmp_path / "cfg" / "kimi.json"
 
     venv_py = _provision_cold("kimi", req_plugin, kimi_cfg)
@@ -461,7 +461,7 @@ def test_cold_seed_repairs_missing_and_stale_host_config_on_reuse(tmp_path: Path
         timeout=60.0,
     )
     req_plugin = tmp_path / "kimi-plugin"
-    (req_plugin / "runtime-requirements.txt").write_text("mindie-harness==0.1.0\n", encoding="utf-8")
+    (req_plugin / "runtime-requirements.txt").write_text(f"mindie-harness=={__version__}\n", encoding="utf-8")
     cfg_path = tmp_path / "cfg" / "kimi.json"
 
     # Initial build writes cfg_path

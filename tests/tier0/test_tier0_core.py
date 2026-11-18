@@ -16,6 +16,7 @@ from mindie_harness.bootstrap.seed_main import (
     render_plugin_bootstrap_template,
     verify_seed_lock,
 )
+from mindie_harness.mcp.router import compute_tool_deadline
 from mindie_harness.mcp.server import read_mcp_message, write_mcp_message
 from mindie_harness.paths import HOSTS, assert_wal_safe_path, is_wsl_drvfs, parse_mountinfo
 from mindie_harness.process.posix import which_posix_binary
@@ -142,6 +143,41 @@ def test_deadline_arithmetic_and_decoupled_mcp_truncation() -> None:
     assert truncated is True
     assert "truncated" in projected
     assert outcome.stdout == big_text  # Process capture untouched
+
+
+@pytest.mark.tier0
+def test_component_tool_deadline_propagates_caller_timeout_ms(monkeypatch: pytest.MonkeyPatch) -> None:
+    """`timeout_ms` propagates into component deadlines with a 600s inner cap + 60s grace."""
+    captured: list[tuple[float, float]] = []
+    real_from_timeout = Deadline.from_timeout
+
+    def _capture(timeout_seconds: float, *, cleanup_grace: float = 0.0, now: float | None = None) -> Deadline:
+        captured.append((float(timeout_seconds), float(cleanup_grace)))
+        return real_from_timeout(timeout_seconds, cleanup_grace=cleanup_grace, now=now)
+
+    monkeypatch.setattr(Deadline, "from_timeout", staticmethod(_capture))
+
+    def _outer(timeout_ms: object = None, *, explicit: float | None = None) -> tuple[float, float]:
+        captured.clear()
+        args = {} if timeout_ms is None else {"timeout_ms": timeout_ms}
+        compute_tool_deadline("component", "profiler", args, explicit_timeout=explicit)
+        assert len(captured) == 1
+        return captured[0]
+
+    # Absent caller timeout keeps the historical 120s inner + 10s grace = 130s outer.
+    assert _outer() == (130.0, 10.0)
+    # 300s caller inner -> 300s + 60s grace = 360s (grace escalates once inner > 120s).
+    assert _outer(300_000) == (360.0, 60.0)
+    # 600s caller inner (the host-plugin ceiling) -> 600s + 60s grace = 660s (Principle 10).
+    assert _outer(600_000) == (660.0, 60.0)
+    # Oversized callers clamp to the 600s inner cap, never exceeding 660s outer.
+    assert _outer(900_000) == (660.0, 60.0)
+    # Non-numeric / boolean / non-finite / non-positive callers fall back to 130s.
+    for invalid in (True, "300000", float("nan"), float("inf"), 0, -1):
+        assert _outer(invalid) == (130.0, 10.0), invalid
+    # An explicit router-level timeout may only extend, never shrink, the outer deadline.
+    assert _outer(600_000, explicit=900.0) == (900.0, 60.0)
+    assert _outer(300_000, explicit=1.0) == (360.0, 60.0)
 
 
 @pytest.mark.tier0

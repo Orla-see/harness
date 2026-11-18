@@ -12,7 +12,7 @@ import time
 from typing import Any
 import pytest
 
-from mindie_harness import Deadline, ProcessSpec, ProfileRef, open_wal_database, run_owned
+from mindie_harness import Deadline, ProcessSpec, ProfileRef, __version__, open_wal_database, run_owned
 from mindie_harness.atomic import atomic_write_json
 from mindie_harness.mcp.router import MCPRouter, RequestContext
 from mindie_harness.mcp.server import MCPStdioServer, read_mcp_message, write_mcp_message
@@ -378,7 +378,7 @@ def test_out_of_tree_wheel_install_and_zero_dependency_smoke(tmp_path: Path) -> 
     blank_cwd = tmp_path / "blank_cwd"
     blank_cwd.mkdir()
     ver = subprocess.run([str(py), "-I", "-m", "mindie_harness.cli", "--version"], cwd=str(blank_cwd), capture_output=True, text=True, check=True)
-    assert ver.stdout.strip() == "mindie-harness 0.1.0"
+    assert ver.stdout.strip() == f"mindie-harness {__version__}"
 
     insp = subprocess.run([str(py), "-I", "-m", "mindie_harness.cli", "inspect", "--host", "codex"], cwd=str(blank_cwd), capture_output=True, text=True, check=True)
     insp_doc = json.loads(insp.stdout)
