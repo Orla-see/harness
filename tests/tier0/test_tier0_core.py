@@ -16,9 +16,15 @@ from mindie_harness.bootstrap.seed_main import (
     render_plugin_bootstrap_template,
     verify_seed_lock,
 )
-from mindie_harness.mcp.router import compute_tool_deadline
+from mindie_harness.mcp.router import (
+    CORRELATION_STRIP_KEYS,
+    FORGED_IDENTITY_KEYS,
+    MCPRouter,
+    RequestContext,
+    compute_tool_deadline,
+)
 from mindie_harness.mcp.server import read_mcp_message, write_mcp_message
-from mindie_harness.paths import HOSTS, assert_wal_safe_path, is_wsl_drvfs, parse_mountinfo
+from mindie_harness.paths import HOSTS, ProfileRef, assert_wal_safe_path, is_wsl_drvfs, parse_mountinfo
 from mindie_harness.process.posix import which_posix_binary
 from mindie_harness.process.win32 import (
     IMAGE_SUBSYSTEM_WINDOWS_CUI,
@@ -261,3 +267,326 @@ def test_dual_mcp_framing_and_rsi_pure_helpers(tmp_path: Path) -> None:
     good_lock.write_text(json.dumps(compute_seed_lock(repo_root / "dist" / "mindie-harness-seed.pyz")), encoding="utf-8")
     with pytest.raises(ValueError, match="integrity mismatch"):
         verify_seed_lock(tampered, good_lock)
+
+
+@pytest.mark.tier0
+def test_mcp_router_silent_default_on_all_surfaces_and_forged_identity_guard(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    profile = ProfileRef.resolve(
+        "codex",
+        plugin_root=tmp_path / "plugin",
+        config_path=tmp_path / "cfg" / "codex.json",
+        data_dir=tmp_path / "data",
+    )
+    tools = [
+        {
+            "name": "knowledge_query",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"},
+                    "mode": {"type": "string"},
+                    "request_nonce": {"type": "string"},
+                    "_mindie_bind_id": {"type": "string"},
+                    "context_file": {"type": "string"},
+                },
+                "required": ["query", "request_nonce", "_mindie_bind_id", "context_file"],
+                "additionalProperties": False,
+            },
+        },
+        {
+            "name": "knowledge_explain",
+            "inputSchema": {
+                "type": "object",
+                "properties": {"ref": {"type": "string"}},
+                "required": ["ref"],
+                "additionalProperties": False,
+            },
+        },
+        {
+            "name": "knowledge_distill",
+            "inputSchema": {
+                "type": "object",
+                "properties": {"summary": {"type": "string"}, "request_nonce": {"type": "string"}},
+                "required": ["summary", "request_nonce"],
+                "additionalProperties": False,
+            },
+        },
+        {
+            "name": "knowledge_sync",
+            "inputSchema": {
+                "type": "object",
+                "properties": {"domain": {"type": "string"}},
+                "additionalProperties": False,
+            },
+        },
+        {
+            "name": "knowledge_feedback",
+            "inputSchema": {
+                "type": "object",
+                "properties": {"ref": {"type": "string"}},
+                "required": ["ref"],
+                "additionalProperties": False,
+            },
+        },
+        {
+            "name": "coordinator",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "argv": {"type": "array"},
+                    "context_file": {"type": "string"},
+                    "_mindie_bind_id": {"type": "string"},
+                    "request_nonce": {"type": "string"},
+                },
+                "required": ["argv", "context_file", "_mindie_bind_id", "request_nonce"],
+                "additionalProperties": False,
+            },
+        },
+    ]
+
+    seen_calls: list[tuple[str, str, Path | None, dict[str, object]]] = []
+    raise_in_handler = False
+
+    def _handler(ctx: RequestContext, args: dict[str, object]) -> dict[str, object]:
+        if raise_in_handler:
+            raise TimeoutError("simulated in-flight tool timeout after dispatch")
+        seen_calls.append((ctx.tool_name, ctx.session_id, ctx.cwd, dict(args)))
+        return {
+            "content": [{"type": "text", "text": json.dumps({"tool": ctx.tool_name, "session_id": ctx.session_id})}],
+            "isError": False,
+        }
+
+    assert CORRELATION_STRIP_KEYS == frozenset({"_mindie_bind_id", "request_nonce", "context_file"})
+
+    # 0. Explicit `tools=[]` stays empty, whereas `tools=None` defaults to `[mindie_status]`.
+    assert MCPRouter(profile, surface="tools", tools=[], base_env={}).list_tools() == []
+    assert [t["name"] for t in MCPRouter(profile, surface="tools", tools=None, base_env={}).list_tools()] == ["mindie_status"]
+
+    # 1. Single-point normalization in `__init__` strips CORRELATION_STRIP_KEYS from `properties` AND `required`.
+    for surface in ("knowledge", "tools", "all"):
+        r = MCPRouter(profile, surface=surface, tools=tools, handler=_handler, base_env={})
+        listed = r.list_tools()
+        assert [t["name"] for t in listed] == [t["name"] for t in tools]
+        for item in listed:
+            prop_fields = set(item.get("inputSchema", {}).get("properties") or ())
+            req_fields = set(item.get("inputSchema", {}).get("required") or ())
+            assert prop_fields.isdisjoint(CORRELATION_STRIP_KEYS), (surface, item["name"], prop_fields)
+            assert req_fields.isdisjoint(CORRELATION_STRIP_KEYS), (surface, item["name"], req_fields)
+    assert not profile.admission_db.exists()
+
+    # 2. Cold-start `call_tool()` on `surface="knowledge"` with zero `_meta` skips `claim_bind` SQLite lock completely.
+    router = MCPRouter(profile, surface="knowledge", tools=tools, handler=_handler, base_env={})
+    expected_fallback = f"codex-conn-{router.connection_id[:12]}"
+
+    bind_cwd = tmp_path / "victim-proj"
+    bind_cwd.mkdir()
+    real_claim_bind = router.binds.claim_bind
+    router.binds.publish_bind(
+        "victim-bind-1",
+        session="victim-sess",
+        surface="knowledge",
+        tool="knowledge_explain",
+        args_digest="unused",
+        cwd=str(bind_cwd),
+    )
+
+    def _forbid_anonymous_claim_bind(**_kwargs: object) -> None:
+        pytest.fail("claim_bind must never be called when both _meta bind_id and session are absent")
+
+    monkeypatch.setattr(router.binds, "claim_bind", _forbid_anonymous_claim_bind)
+
+    q_res = router.call_tool(
+        {
+            "jsonrpc": "2.0",
+            "id": "kq-1",
+            "method": "tools/call",
+            "params": {"name": "knowledge_query", "arguments": {"query": "aclgraph", "mode": "explore"}},
+        }
+    )
+    assert q_res["isError"] is False
+    assert seen_calls[-1] == (
+        "knowledge_query",
+        expected_fallback,
+        None,
+        rsi_explore.parse_args({"query": "aclgraph", "mode": "explore"}),
+    )
+    assert not profile.admission_db.exists()
+    assert not profile.receipts_db.exists()  # Read-only fast-lane query never creates receipts DB!
+
+    bad_rsi = router.call_tool(
+        {
+            "jsonrpc": "2.0",
+            "id": "kq-bad-rsi",
+            "method": "tools/call",
+            "params": {"name": "knowledge_query", "arguments": {"query": "aclgraph", "mode": "invalid"}},
+        }
+    )
+    assert bad_rsi["isError"] is True
+    assert bad_rsi["structuredContent"]["reason"] == "invalid_rsi_arguments"
+
+    # Model-supplied `_mindie_bind_id` in `arguments` is stripped and NEVER used to claim `victim-bind-1`!
+    e_res = router.call_tool(
+        {
+            "jsonrpc": "2.0",
+            "id": "ke-1",
+            "method": "tools/call",
+            "params": {
+                "name": "knowledge_explain",
+                "arguments": {
+                    "ref": "mindie://unit/1",
+                    "request_nonce": "legacy-nonce",
+                    "_mindie_bind_id": "victim-bind-1",
+                    "context_file": "/tmp/legacy-ctx.json",
+                },
+            },
+        }
+    )
+    assert e_res["isError"] is False
+    assert seen_calls[-1] == (
+        "knowledge_explain",
+        expected_fallback,
+        None,
+        rsi_explore.parse_args({"ref": "mindie://unit/1"}),
+    )
+    assert not profile.receipts_db.exists()
+
+    # Host-supplied `_meta.bind_id` DOES claim the pending bind and enrich `session_id` + `cwd`.
+    monkeypatch.setattr(router.binds, "claim_bind", real_claim_bind)
+    meta_bind_res = router.call_tool(
+        {
+            "jsonrpc": "2.0",
+            "id": "ke-meta-bind",
+            "method": "tools/call",
+            "params": {
+                "name": "knowledge_explain",
+                "arguments": {"ref": "mindie://unit/1"},
+                "_meta": {"bind_id": "victim-bind-1"},
+            },
+        }
+    )
+    assert meta_bind_res["isError"] is False
+    assert seen_calls[-1] == (
+        "knowledge_explain",
+        "victim-sess",
+        bind_cwd,
+        rsi_explore.parse_args({"ref": "mindie://unit/1"}),
+    )
+
+    # 3. Non-readonly mutating `knowledge_*` tools succeed on cold start & enforce idempotent RemoteReceipts.
+    for idx, (tname, targs) in enumerate(
+        (
+            ("knowledge_distill", {"summary": "verified tile rule", "request_nonce": "strip-me"}),
+            ("knowledge_sync", {"domain": "operators"}),
+            ("knowledge_feedback", {"ref": "mindie://unit/1"}),
+        )
+    ):
+        m_res = router.call_tool(
+            {
+                "jsonrpc": "2.0",
+                "id": f"mut-{idx}",
+                "method": "tools/call",
+                "params": {"name": tname, "arguments": targs},
+            }
+        )
+        assert m_res["isError"] is False
+        assert seen_calls[-1][1] == expected_fallback
+    assert not profile.admission_db.exists()
+    assert profile.receipts_db.is_file()
+
+    dup_res = router.call_tool(
+        {
+            "jsonrpc": "2.0",
+            "id": "mut-0",
+            "method": "tools/call",
+            "params": {"name": "knowledge_distill", "arguments": {"summary": "verified tile rule"}},
+        }
+    )
+    assert dup_res["isError"] is True
+    assert dup_res["structuredContent"]["reason"] == "duplicate_request"
+
+    # 4. `FORGED_IDENTITY_KEYS` remain strictly rejected on both `knowledge_*` and deterministic tools.
+    for key in FORGED_IDENTITY_KEYS:
+        for tname, base_arg in (("knowledge_query", {"query": "x"}), ("coordinator", {"argv": ["hosts"]})):
+            forged_res = router.call_tool(
+                {
+                    "jsonrpc": "2.0",
+                    "id": f"forged-{tname}-{key}",
+                    "method": "tools/call",
+                    "params": {"name": tname, "arguments": {**base_arg, key: "forged-value"}},
+                }
+            )
+            assert forged_res["isError"] is True
+            assert forged_res["structuredContent"]["reason"] == "forged_identity_argument"
+
+    # 5. Principle 14 + Iron Rule 2: pre-dispatch `TimeoutError` -> `not_sent`; post-dispatch `TimeoutError` -> `uncertain`.
+    def _timeout_claim_bind(**_kwargs: object) -> None:
+        raise TimeoutError("simulated bind SQLite deadline exceeded")
+
+    monkeypatch.setattr(router.binds, "claim_bind", _timeout_claim_bind)
+    pre_to_res = router.call_tool(
+        {
+            "jsonrpc": "2.0",
+            "id": "kq-pre-timeout",
+            "method": "tools/call",
+            "params": {
+                "name": "knowledge_query",
+                "arguments": {"query": "x"},
+                "_meta": {"session_id": "s-pre-timeout"},
+            },
+        }
+    )
+    assert pre_to_res["isError"] is True
+    assert pre_to_res["structuredContent"]["reason"] == "helper_timeout"
+    assert pre_to_res["structuredContent"]["submission_state"] == "not_sent"
+
+    monkeypatch.setattr(router.binds, "claim_bind", real_claim_bind)
+    raise_in_handler = True
+    post_to_res = router.call_tool(
+        {
+            "jsonrpc": "2.0",
+            "id": "kq-post-timeout",
+            "method": "tools/call",
+            "params": {"name": "knowledge_query", "arguments": {"query": "x"}},
+        }
+    )
+    assert post_to_res["isError"] is True
+    assert post_to_res["structuredContent"]["reason"] == "helper_timeout"
+    assert post_to_res["structuredContent"]["submission_state"] == "uncertain"
+
+    # 6. Cold-start concurrent initialization storm on `RemoteReceipts` and `BindStore` (zero `database is locked`).
+    from mindie_harness.mcp.receipts import BindStore, RemoteReceipts
+    import threading
+
+    cold_receipts = RemoteReceipts(tmp_path / "cold-storm" / "receipts.sqlite3", max_concurrent=16)
+    cold_binds = BindStore(tmp_path / "cold-storm" / "binds.sqlite3")
+    barrier = threading.Barrier(8)
+    storm_errors: list[BaseException] = []
+
+    def _storm_worker(idx: int) -> None:
+        try:
+            barrier.wait(timeout=5.0)
+            assert cold_receipts.claim(
+                f"call-{idx}",
+                session=f"sess-{idx}",
+                tool="remote_bash",
+                args_sha256=f"sha-{idx}",
+            )
+            cold_receipts.finish(f"call-{idx}", "succeeded")
+            cold_binds.publish_bind(
+                f"bind-{idx}",
+                session=f"sess-{idx}",
+                surface="remote",
+                tool="remote_bash",
+                args_digest=f"sha-{idx}",
+            )
+        except BaseException as exc:
+            storm_errors.append(exc)
+
+    threads = [threading.Thread(target=_storm_worker, args=(i,)) for i in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=5.0)
+    assert storm_errors == []
