@@ -15,10 +15,14 @@ import argparse
 import json
 import os
 import re
-import subprocess
 import sys
 from pathlib import Path
 from typing import Any, Mapping
+
+try:
+    from mindie_harness.process import Deadline, ProcessSpec, run_owned
+except ImportError:  # pragma: no cover - package-relative fallback
+    from ...process import Deadline, ProcessSpec, run_owned
 
 
 _RELATIVE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.\-/]{0,191}$")
@@ -88,14 +92,28 @@ def dispatch(operation: str, root: Path, bindings_path: str | None,
     child_payload = dict(payload)
     child_payload["runtime_binding"] = binding
     child_payload["bindings_file"] = str(path)
-    process = subprocess.run(
-        [runtime_python, str(target), operation, "--root", str(root)],
-        input=json.dumps(child_payload, ensure_ascii=False, sort_keys=True),
-        text=True,
-        cwd=str(root),
-        check=False,
+    timeout = binding.get("timeout_s", 3600)
+    if isinstance(timeout, bool) or not isinstance(timeout, (int, float)):
+        raise ValueError("timeout_s must be a number")
+    timeout = max(1, min(int(timeout), 86400))
+    outcome = run_owned(
+        ProcessSpec(
+            argv=(runtime_python, str(target), operation, "--root", str(root)),
+            cwd=root,
+            stdin_bytes=json.dumps(child_payload, ensure_ascii=False, sort_keys=True).encode("utf-8"),
+            allowed_returncodes=None,
+        ),
+        deadline=Deadline.from_timeout(timeout),
     )
-    return process.returncode
+    if outcome.stdout:
+        sys.stdout.write(outcome.stdout)
+        sys.stdout.flush()
+    if outcome.stderr:
+        sys.stderr.write(outcome.stderr)
+        sys.stderr.flush()
+    if outcome.execution == "unknown":
+        raise TimeoutError(f"{operation} returned unknown execution state")
+    return outcome.returncode if outcome.returncode is not None else 2
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -110,6 +128,9 @@ def main(argv: list[str] | None = None) -> int:
         if not isinstance(payload, Mapping):
             raise ValueError("payload must be a JSON object")
         return dispatch(args.operation, args.root, args.bindings, payload)
+    except TimeoutError as exc:
+        print(json.dumps({"status": "unknown", "error": str(exc)}, ensure_ascii=False))
+        return 2
     except (OSError, ValueError, json.JSONDecodeError) as exc:
         print(json.dumps({"status": "failed", "error": str(exc)}, ensure_ascii=False))
         return 2

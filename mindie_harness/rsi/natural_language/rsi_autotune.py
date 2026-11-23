@@ -15,13 +15,17 @@ import argparse
 import hashlib
 import itertools
 import json
-import subprocess
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
+
+try:
+    from mindie_harness.process import Deadline, ProcessSpec, run_owned
+except ImportError:  # pragma: no cover - package-relative fallback
+    from ...process import Deadline, ProcessSpec, run_owned
 
 try:
     from rsi_plan import SCHEMA, PlanError, validate
@@ -204,14 +208,22 @@ class ActionRunner:
         if self.bindings:
             command.extend(("--bindings", self.bindings))
         try:
-            process = subprocess.run(command, input=_json(payload), text=True,
-                                     capture_output=True, timeout=self.timeout_s,
-                                     check=False, cwd=self.root)
-        except subprocess.TimeoutExpired as exc:
+            outcome = run_owned(
+                ProcessSpec(
+                    argv=tuple(command),
+                    cwd=Path(self.root),
+                    stdin_bytes=_json(payload).encode("utf-8"),
+                    allowed_returncodes=None,
+                ),
+                deadline=Deadline.from_timeout(self.timeout_s),
+            )
+        except TimeoutError as exc:
             raise UnknownExternalEffect(f"{operation} timed out") from exc
-        if process.returncode not in (0, 2):
-            raise AutotuneError(process.stderr.strip() or f"{operation} failed")
-        for line in reversed((process.stdout or "").splitlines()):
+        if outcome.execution == "unknown":
+            raise UnknownExternalEffect(f"{operation} returned unknown execution state")
+        if outcome.returncode not in (0, 2):
+            raise AutotuneError(outcome.stderr.strip() or f"{operation} failed")
+        for line in reversed(outcome.stdout.splitlines()):
             try:
                 value = json.loads(line)
             except json.JSONDecodeError:
@@ -221,7 +233,7 @@ class ActionRunner:
                 if _status(receipt) in UNKNOWN_EXTERNAL:
                     raise UnknownExternalEffect(f"{operation} returned {_status(receipt)}")
                 return ActionReceipt(operation, receipt)
-        return ActionReceipt(operation, {"status": "completed", "stdout": process.stdout})
+        return ActionReceipt(operation, {"status": "completed", "stdout": outcome.stdout})
 
 
 class DryRunRunner:

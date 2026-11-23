@@ -13,7 +13,8 @@ from __future__ import annotations
 
 from typing import Any, Mapping
 
-SPECULATIVE_METHODS = ("mtp", "dflash", "dflash2", "dspark")
+SPECULATIVE_METHODS = ("mtp", "dflash", "dspark")
+_SPECULATIVE_METHOD_ALIASES = {"dflash2": "dflash", "dflash-2": "dflash"}
 DEFAULT_CANDIDATE_ORDER = ("runtime_parameters", "startup_features")
 DEFAULT_PROFILE_BINDING = {
     "tool": "msprof",
@@ -66,12 +67,23 @@ def algorithm_exploration_allowed(payload: Mapping[str, Any]) -> bool:
     return False
 
 
+def normalize_speculative_method(value: Any) -> Any:
+    """Normalize conversational aliases to the runtime method vocabulary."""
+    if not isinstance(value, str):
+        return value
+    method = value.strip().lower().replace("_", "-")
+    return _SPECULATIVE_METHOD_ALIASES.get(method, method)
+
+
 def questions(payload: Mapping[str, Any]) -> list[dict[str, Any]]:
     """Ask only for values that have no safe default."""
     result: list[dict[str, Any]] = []
     text = " ".join(str(payload.get(key) or "") for key in ("objective", "test_description", "optimization_request")).lower()
-    method = str(payload.get("speculative_method") or "").lower()
-    mentions_speculation = method in SPECULATIVE_METHODS or any(name in text for name in SPECULATIVE_METHODS + ("speculative", "投机"))
+    method = normalize_speculative_method(payload.get("speculative_method"))
+    method = str(method or "")
+    mentions_speculation = method in SPECULATIVE_METHODS or any(
+        name in text for name in SPECULATIVE_METHODS + tuple(_SPECULATIVE_METHOD_ALIASES) + ("speculative", "投机")
+    )
     if mentions_speculation and not method:
         result.append({
             "field": "speculative_method",

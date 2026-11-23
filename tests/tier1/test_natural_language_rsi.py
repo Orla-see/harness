@@ -401,6 +401,16 @@ def test_speculative_request_asks_for_method_and_weights():
     items = rsi_defaults.questions({"optimization_request": "优化投机解码"})
     fields = {item["field"] for item in items}
     assert {"speculative_method", "speculative_weights"} <= fields
+    choices = next(item["choices"] for item in items if item["field"] == "speculative_method")
+    assert "dflash2" not in choices
+
+
+def test_dflash2_alias_uses_the_dflash_runtime_method():
+    plan = base_plan()
+    plan["payload"] = {"speculative_method": "dflash2"}
+    normalized = rsi_plan.validate(plan)
+    assert normalized["payload"]["speculative_method"] == "dflash"
+    assert rsi_defaults.normalize_speculative_method("dflash-2") == "dflash"
 
 
 def test_selected_method_and_weights_remove_followup_questions():

@@ -22,12 +22,16 @@ import json
 import os
 import re
 import shlex
-import subprocess
 import sys
 import time
 import uuid
 from pathlib import Path
 from typing import Any, Mapping, Sequence
+
+try:
+    from mindie_harness.process import Deadline, ProcessSpec, run_owned
+except ImportError:  # pragma: no cover - package-relative fallback
+    from ...process import Deadline, ProcessSpec, run_owned
 
 COMMAND_KEYS = {
     "doctor": ("doctor_cmd",),
@@ -160,30 +164,33 @@ def _run(root: Path, operation: str, payload: Mapping[str, Any],
     if not isinstance(cwd, str) or not cwd:
         raise ValueError("cwd must be a non-empty string")
     try:
-        process = subprocess.run(
-            argv,
-            input=json.dumps(dict(payload), ensure_ascii=False, sort_keys=True),
-            text=True,
-            capture_output=True,
-            timeout=timeout,
-            cwd=cwd,
-            env=_environment(binding, payload),
-            check=False,
+        outcome = run_owned(
+            ProcessSpec(
+                argv=tuple(argv),
+                cwd=Path(cwd),
+                env=_environment(binding, payload),
+                stdin_bytes=json.dumps(dict(payload), ensure_ascii=False, sort_keys=True).encode("utf-8"),
+                allowed_returncodes=None,
+            ),
+            deadline=Deadline.from_timeout(timeout),
         )
-    except subprocess.TimeoutExpired as exc:
+    except TimeoutError as exc:
         return {"status": "unknown", "passed": False,
                 "reason": f"{operation}_timeout", "timeout_s": timeout,
                 "error": str(exc)}
     except OSError as exc:
         return {"status": "infra_failed", "passed": False, "reason": str(exc)}
-    result = _parse(process.stdout or "")
+    if outcome.execution == "unknown":
+        return {"status": "unknown", "passed": False,
+                "reason": f"{operation}_unknown", "timeout_s": timeout}
+    result = _parse(outcome.stdout)
     if not result:
-        result = {"stdout": (process.stdout or "")[-12000:]}
-    result.setdefault("status", "completed" if process.returncode == 0 else "failed")
-    result.setdefault("passed", process.returncode == 0)
-    result["returncode"] = process.returncode
-    if process.stderr:
-        result["stderr"] = process.stderr[-12000:]
+        result = {"stdout": outcome.stdout[-12000:]}
+    result.setdefault("status", "completed" if outcome.returncode == 0 else "failed")
+    result.setdefault("passed", outcome.returncode == 0)
+    result["returncode"] = outcome.returncode
+    if outcome.stderr:
+        result["stderr"] = outcome.stderr[-12000:]
     return result
 
 

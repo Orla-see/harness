@@ -19,9 +19,9 @@ from pathlib import Path
 from typing import Any
 
 try:
-    from rsi_defaults import default_settings, questions
+    from rsi_defaults import default_settings, normalize_speculative_method, questions
 except ImportError:  # pragma: no cover - direct package execution fallback
-    from .rsi_defaults import default_settings, questions
+    from .rsi_defaults import default_settings, normalize_speculative_method, questions
 
 SCHEMA = "mindie-agent/rsi-plan/v1"
 OPERATIONS = (
@@ -148,6 +148,8 @@ def validate(plan: Any) -> dict[str, Any]:
 
     defaults = default_settings(payload)
     payload = dict(payload)
+    if "speculative_method" in payload:
+        payload["speculative_method"] = normalize_speculative_method(payload["speculative_method"])
     payload.setdefault("profile_binding", defaults["profile_binding"])
     payload.setdefault("optimization_scope", defaults["optimization_scope"])
     payload.setdefault("algorithm_exploration_policy", defaults["algorithm_exploration_policy"])
