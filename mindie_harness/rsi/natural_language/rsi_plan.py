@@ -26,7 +26,7 @@ except ImportError:  # pragma: no cover - direct package execution fallback
 SCHEMA = "mindie-agent/rsi-plan/v1"
 OPERATIONS = (
     "doctor", "status", "prepare", "build", "profile", "accuracy",
-    "performance", "run", "resume", "report", "record",
+    "simulation", "performance", "run", "resume", "report", "record",
     "cleanup",
 )
 _TASK = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,95}$")

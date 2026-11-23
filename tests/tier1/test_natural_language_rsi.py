@@ -32,6 +32,7 @@ from mindie_harness.rsi.natural_language import rsi_evidence
 from mindie_harness.rsi.natural_language import rsi_install
 from mindie_harness.rsi.natural_language import rsi_plan
 from mindie_harness.rsi.natural_language import rsi_runtime_adapter
+from mindie_harness.rsi.natural_language import rsi_simulation
 from mindie_harness.rsi.natural_language import rsi_trend
 from mindie_harness.rsi.natural_language import rsi_workload
 
@@ -522,6 +523,109 @@ def test_reference_adapter_missing_evidence_fails_closed(tmp_path):
     assert result["status"] == "unavailable"
     assert result["passed"] is False
     assert result["reason"] == "accuracy_command_not_configured"
+
+
+def test_simulation_receipt_normalizes_metrics_and_keeps_analytical_evidence(tmp_path):
+    command = tmp_path / "simulator.py"
+    command.write_text(
+        "import json\n"
+        "print(json.dumps({'status': 'completed', 'throughput': 120, 'ttft_ms': 8, 'oom': False}))\n",
+        encoding="utf-8",
+    )
+    result = rsi_runtime_adapter.dispatch(
+        "simulation", tmp_path,
+        {"objective": "maximize throughput",
+         "runtime_binding": {"commands": {"simulation_cmd": [sys.executable, str(command)]}}},
+    )
+    assert result["evidence_kind"] == "analytical"
+    assert result["eligible_for_measurement"] is True
+    assert result["metrics"]["throughput_tokens_s"] == 120
+    assert result["simulation_score"] == 120
+
+
+def test_simulation_adapter_reads_standard_output_artifacts(tmp_path):
+    output = tmp_path / "sim-output"
+    output.mkdir()
+    (output / "predict_dict.json").write_text(
+        json.dumps({"decode": {"throughput_tokens_s": 88}}), encoding="utf-8"
+    )
+    (output / "memory_dict.json").write_text(
+        json.dumps({"rank_0": {"oom": True}}), encoding="utf-8"
+    )
+    command = tmp_path / "silent_simulator.py"
+    command.write_text("print('simulation complete')\n", encoding="utf-8")
+    result = rsi_runtime_adapter.dispatch(
+        "simulation", tmp_path,
+        {"objective": "maximize throughput", "simulation_output_dir": str(output),
+         "runtime_binding": {"commands": {"simulation_cmd": [sys.executable, str(command)]}}},
+    )
+    assert result["metrics"]["throughput_tokens_s"] == 88
+    assert result["oom"] is True
+    assert result["eligible_for_measurement"] is False
+
+
+def test_simulation_rank_prefers_higher_throughput():
+    ranked = rsi_simulation.rank({
+        "slow": {"eligible_for_measurement": True, "simulation_score": 10},
+        "fast": {"eligible_for_measurement": True, "simulation_score": 20},
+        "oom": {"eligible_for_measurement": False, "simulation_score": 100},
+    }, 1)
+    assert ranked == ["fast"]
+
+
+def test_simulation_round_filters_candidates_before_measurement(tmp_path):
+    candidates = [
+        {"candidate_id": "slow", "method": "config", "config": {"k": 1}},
+        {"candidate_id": "fast", "method": "config", "config": {"k": 2}},
+    ]
+    candidate_plan = plan(tmp_path, candidates=candidates)
+    candidate_plan["operations"] = ["simulation", "prepare", "build", "accuracy", "performance", "cleanup"]
+    candidate_plan["payload"].update({"simulation_top_k": 1})
+
+    class SimulatorRunner(ScriptedRunner):
+        def run(self, operation, payload):
+            self.calls.append(operation)
+            if operation == "simulation":
+                candidate = payload["candidate"]["candidate_id"]
+                return rsi_autotune.ActionReceipt(operation, {
+                    "status": "completed", "passed": True,
+                    "evidence_kind": "analytical", "eligible_for_measurement": True,
+                    "simulation_score": 20 if candidate == "fast" else 10,
+                    "metrics": {"throughput_tokens_s": 20 if candidate == "fast" else 10},
+                })
+            return super().run(operation, payload)
+
+    runner = SimulatorRunner()
+    controller = rsi_autotune.AutotuneController(
+        candidate_plan, runner, tmp_path / "state", workers=2,
+        required_gates=rsi_autotune.DEFAULT_REQUIRED_GATES,
+    )
+    first = controller.run_once()
+    assert first["status"] == "simulation_completed"
+    assert first["selected_for_measurement"] == ["fast"]
+    second = controller.run_once()
+    assert second["best"]["candidate_id"] == "fast"
+    assert [call for call in runner.calls if call == "simulation"] == ["simulation", "simulation"]
+
+
+def test_simulation_infrastructure_failure_does_not_discard_candidates(tmp_path):
+    candidate_plan = plan(tmp_path)
+    candidate_plan["operations"] = ["simulation", "performance"]
+
+    class FailedSimulator:
+        def run(self, operation, payload):
+            return rsi_autotune.ActionReceipt(operation, {
+                "status": "failed", "passed": False, "reason": "simulator_unavailable"
+            })
+
+    controller = rsi_autotune.AutotuneController(
+        candidate_plan, FailedSimulator(), tmp_path / "state", workers=1,
+        required_gates=(),
+    )
+    result = controller.run_once()
+    assert result["status"] == "simulation_failed"
+    queue = json.loads((tmp_path / "state" / "autotune-queue.json").read_text())
+    assert queue["candidates"][0]["status"] == "pending"
 
 
 def test_reference_adapter_wrapper_round_trip(tmp_path):
